@@ -1,7 +1,7 @@
 /*
 ## 核心功能
 
-提供 measure native latency 开发脚本，服务构建、校验、生成或发布前检查。
+提供 native latency 基准：计时前运行正确性回归，记录输入、环境、源码身份和原始样本。
 
 ## 输入
 
@@ -30,10 +30,13 @@ import path from 'path';
 import { performance } from 'perf_hooks';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { cpus, platform, arch } from 'node:os';
 import { JSDOM } from 'jsdom';
 
 // This benchmark intentionally measures end-to-end preview latency:
-// fixture read + native preview pipeline + triplet DOM settle wait.
+// native preview pipeline + triplet DOM settle wait (fixture IO is outside timing).
 // It is a smoke baseline, not a renderer-only microbenchmark.
 const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
@@ -96,10 +99,15 @@ function parseArgs(argv) {
     switchIterations: 20,
     editIterations: 20,
     jsonOut: '',
+    skipChecks: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
+    if (arg === '--skip-checks') {
+      options.skipChecks = true;
+      continue;
+    }
     if (arg === '--rounds' && argv[i + 1]) {
       options.rounds = parsePositiveInt(argv[i + 1], options.rounds);
       i += 1;
@@ -232,8 +240,63 @@ async function runRound({ corpus, measure, options }) {
   };
 }
 
+const correctnessSuites = [
+  'tests/parity_corpus.test.js',
+  'tests/obsidian_triplet_renderer.test.js',
+  'tests/obsidian_triplet_serializer.test.js',
+];
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+function fileDigest(relativePath) {
+  return sha256(fs.readFileSync(path.resolve(repoRoot, relativePath)));
+}
+function gitRead(args) {
+  return execFileSync('git', args, { cwd: repoRoot, encoding: 'utf8' }).trim();
+}
+function benchmarkIdentity(corpus) {
+  const tracked = gitRead(['ls-files', '-z']).split('\0').filter(Boolean).sort();
+  const sourceFiles = tracked.filter(name => /^(services\/|themes\/|lib\/|tests\/helpers\/)/.test(name)
+    || ['converter.js', 'scripts/measure-native-latency.mjs', 'vitest.config.mjs'].includes(name)
+    || correctnessSuites.includes(name));
+  return {
+    revision: gitRead(['rev-parse', 'HEAD']),
+    // Commit alone is insufficient when benchmarking a working tree.
+    dirty: gitRead(['status', '--porcelain', '--untracked-files=normal']).length > 0,
+    sourceSha256: sha256(JSON.stringify(sourceFiles.map(name => [name, fileDigest(name)]))),
+    generatedRuntimeSha256: sha256(JSON.stringify([
+      'lib/markdown-it.min.js', 'lib/highlight.min.js', 'lib/mathjax-plugin.js',
+    ].map(name => [name, fileDigest(name)]))),
+    lockfileSha256: fileDigest('package-lock.json'),
+    corpusSha256: fileDigest('tests/fixtures/parity/corpus.json'),
+    nodeVersion: process.version,
+    platform: platform(),
+    arch: arch(),
+    cpuModel: cpus()[0]?.model || 'unknown',
+    jsdomVersion: require('jsdom/package.json').version,
+    fixtures: corpus.map(sample => ({
+      id: sample.id,
+      fixture: sample.fixture,
+      sourcePath: sample.sourcePath || sample.fixture,
+      sha256: fileDigest(`tests/fixtures/${sample.fixture}`),
+      expectedCleanHtmlSha256: fileDigest(`tests/fixtures/${sample.expectedCleanHtml}`),
+    })),
+  };
+}
+function verifyCorrectness(skipChecks) {
+  if (skipChecks) return { status: 'skipped', suites: correctnessSuites };
+  console.log('[native-latency:e2e] Running correctness suites outside measured intervals.');
+  execFileSync(process.execPath, [
+    path.resolve(repoRoot, 'node_modules/vitest/vitest.mjs'), 'run', '--maxWorkers=1', ...correctnessSuites,
+  ], { cwd: repoRoot, stdio: 'inherit', timeout: 120_000 });
+  return {
+    status: 'passed',
+    suites: correctnessSuites,
+    scope: 'Mock/JSDOM renderer and serializer regression suites; not real Obsidian visual certification.',
+  };
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const correctness = verifyCorrectness(options.skipChecks);
   const converter = await createLegacyConverter();
   const markdownRenderer = {
     async renderMarkdown(markdown, el) {
@@ -254,6 +317,7 @@ async function main() {
 
   const corpusPath = path.resolve(repoRoot, 'tests/fixtures/parity/corpus.json');
   const corpus = JSON.parse(fs.readFileSync(corpusPath, 'utf8'));
+  const identity = benchmarkIdentity(corpus);
 
   const measure = async (markdown, sourcePath) => {
     const start = performance.now();
@@ -276,7 +340,7 @@ async function main() {
 
   console.log(
     '[native-latency:e2e] Measures end-to-end preview latency ' +
-    '(fixture IO + render pipeline + DOM settle wait).'
+    '(render pipeline + DOM settle wait; fixture IO excluded).'
   );
   console.log('[native-latency:e2e] Not a renderer-only microbenchmark.');
   console.log(
@@ -308,12 +372,16 @@ async function main() {
       outputPath,
       JSON.stringify({
         mode: 'native-latency-e2e',
+        reportVersion: 2,
+        identity,
+        correctness,
         generatedAt: new Date().toISOString(),
         corpusSize: corpus.length,
         options,
         rounds: rounds.map((round, index) => ({
           round: index + 1,
           summary: round.summary,
+          samples: round.samples,
         })),
         aggregate: mergedSummary,
         stability,

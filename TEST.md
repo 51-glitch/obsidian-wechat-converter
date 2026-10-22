@@ -235,3 +235,26 @@ interface CardExportBatch {
 > 3. 点击「取消导出」即时终止后续调度，保留已保存图片；
 > 4. 全部成功或用户取消时不写冗余清单，仅在有失败页时落盘 `export-manifest.json` 并支持失败页断点重试。
 
+
+## 并发、拒绝与基准回归
+
+定向检查：
+
+```sh
+npx vitest run tests/concurrency.test.js tests/card_resource_loaders.test.js tests/wechat_sync.test.js tests/card_export_manifest.test.js
+```
+
+测试用受控 Promise 保持任务在途，验证限流、失败后停止调度、不可中断 IO 的晚到结果丢弃、取消后已开始页落账。
+混合图片与非法链接在两种排列下都必须阻止创建/更新草稿及目录清理；已完成的上传不因此回滚。
+
+先执行 `npm ci` 和 `npm run generate:runtime`，再运行基准：
+
+```sh
+npm run measure:latency -- --rounds 5 --json-out /tmp/native-latency.json
+```
+
+基准默认先运行 corpus、Triplet renderer/serializer 正确性回归；失败即终止，不输出成功性能报告。
+报告保存提交、工作区脏状态、源码/锁文件/样本摘要、环境及原始计时样本。
+正确性检查位于计时之外；计时包含渲染和 DOM settle，样本读取位于计时之外。
+`--skip-checks` 仅用于诊断，报告明确标记 skipped，不应作为验证通过的优化依据。
+这些检查使用模拟渲染器和 JSDOM，仍需真实 Obsidian 与微信的视觉、粘贴和同步验证。

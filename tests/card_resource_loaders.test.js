@@ -10,7 +10,7 @@
 
 ## 输出
 
-断言各来源读到的 Blob 类型与字节，以及全局 fetch 不被调用。
+断言各来源读到的 Blob 类型与字节，以及全局 fetch 不被调用；取消时丢弃不可中断 IO 的晚到结果。
 */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
@@ -65,6 +65,33 @@ describe("createDefaultLoaders().fetchBlob", () => {
       createDefaultLoaders().fetchBlob("app://local/missing.png", new AbortController().signal, { app: null }),
     ).rejects.toThrow("无法读取图片资源");
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("读取 vault 文件期间取消：等待 IO 返回后丢弃晚到字节", async () => {
+    let finishRead;
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const app = { vault: {
+      getAbstractFileByPath: () => ({ path: "img/late.png" }),
+      readBinary: () => {
+        markStarted();
+        return new Promise(resolve => { finishRead = resolve; });
+      },
+    } };
+    const controller = new AbortController();
+    let settled = false;
+    const pending = createDefaultLoaders().fetchBlob(
+      "app://local/img/late.png", controller.signal,
+      { vaultPath: "img/late.png", app },
+    ).finally(() => { settled = true; });
+    const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await started;
+    controller.abort();
+    await Promise.resolve();
+    expect(settled).toBe(false); // vault IO itself is not abortable
+    finishRead(new Uint8Array([1, 2, 3]).buffer);
+    await rejected;
+    expect(settled).toBe(true);
   });
 
   it("已中止的 signal 立即拒绝", async () => {
