@@ -1,7 +1,7 @@
 /*
 ## 核心功能
 
-覆盖 wechat sync 相关行为的 Vitest 测试用例。
+覆盖 wechat sync 相关行为及混合错误、拒绝后的草稿与清理边界。
 
 ## 输入
 
@@ -545,6 +545,41 @@ describe('Wechat Sync Service', () => {
     ]);
     expect(result.blockingIssues.map((issue) => issue.value)).not.toContain('https://mp.weixin.qq.com/s/public-article');
     expect(result.blockingIssues.map((issue) => issue.value)).not.toContain('https://mp.weixin.qq.com/mp/appmsgalbum?__biz=MzA');
+  });
+
+  it.each(['create', 'update'])('混合图片降级与非法链接：%s 被拒后不写草稿、不清理目录', async (mode) => {
+    const api = createMockApi();
+    const cleanup = vi.fn(async () => ({}));
+    const good = '<img src="https://mmbiz.qpic.cn/valid.png">';
+    const failed = '<img src="file:///missing.png">';
+    const blocked = '<a href="https://developers.weixin.qq.com/platform">开发者平台</a>';
+    const service = createWechatSyncService({
+      createApi: () => api,
+      srcToBlob: vi.fn(),
+      processAllImages: async html => html,
+      processMathFormulas: async html => html,
+      cleanHtmlForDraft: html => html,
+      cleanupConfiguredDirectory: cleanup,
+      getFirstImageFromArticle: () => '',
+    });
+    for (const fragments of [[failed, good, blocked], [blocked, good, failed]]) {
+      const html = fragments.join('');
+      const degraded = replaceUnuploadedDraftImagesWithPlaceholders(html);
+      expect(degraded.imageSources).toEqual(['file:///missing.png']);
+      expect(degraded.html).toContain('https://mmbiz.qpic.cn/valid.png');
+      expect(inspectWechatDraftContent(degraded.html).blockingIssues.map(issue => issue.code))
+        .toEqual(['draft_unsupported_wechat_link']);
+      await expect(service.syncToDraft({
+        account: { appId: 'wx1', appSecret: 'sec' },
+        currentHtml: html,
+        sessionThumbMediaId: 'existing-thumb',
+        ...(mode === 'update' ? { draftMediaId: 'existing-draft', draftIndex: 0 } : {}),
+      })).rejects.toThrow('后台/开发者平台链接');
+    }
+    expect(api.createDraft).not.toHaveBeenCalled();
+    expect(api.updateDraft).not.toHaveBeenCalled();
+    expect(api.uploadCover).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
   });
 
   it('should block draft creation when final html keeps unconverted svg', async () => {

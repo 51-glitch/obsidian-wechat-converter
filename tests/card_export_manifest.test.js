@@ -142,6 +142,42 @@ describe("清单：干净批次不落盘", () => {
   });
 });
 
+describe("导出在途取消", () => {
+  it("捕获尚未返回时取消：已开始页保存落账，后续页不再启动", async () => {
+    const ctx = sessionWithSnapshot(3);
+    const fakeFs = createFakeFs();
+    let finishCapture;
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const captured = [];
+    const exporter = buildExporter(ctx, fakeFs, ({ pageId }) => {
+      captured.push(pageId);
+      markStarted();
+      return new Promise(resolve => { finishCapture = resolve; });
+    });
+    const pending = exporter.exportCards(exportInput(ctx));
+    await started;
+    const active = ctx.session.getActiveJob();
+    expect(active.snapshotId).toBe(ctx.snapshot.snapshotId);
+    ctx.session.requestCancel(active.jobId);
+    expect(ctx.session.getActiveJob().state).toBe("canceling");
+    expect(fakeFs.calls.created).toEqual([]);
+    finishCapture({ bytes: makePngBytes(750, 1000) });
+    const outcome = await pending;
+    expect(outcome.status).toBe("canceled");
+    expect(captured).toEqual(["page-1"]);
+    expect(outcome.results.map(({ pageId, status }) => [pageId, status])).toEqual([
+      ["page-1", "saved"], ["page-2", "canceled"], ["page-3", "canceled"],
+    ]);
+    expect(fakeFs.calls.created.filter(path => path.endsWith(".png"))).toHaveLength(1);
+    expect(fakeFs.manifestWrites()).toEqual([]);
+    expect(ctx.session.getActiveJob()).toBeNull();
+    const last = ctx.session.getLastJob();
+    expect(last.snapshotId).toBe(ctx.snapshot.snapshotId);
+    expect(last.results.every(result => result.snapshotId === ctx.snapshot.snapshotId)).toBe(true);
+  });
+});
+
 describe("清单：出现失败页才落盘", () => {
   it("首个失败页即启用落盘；收尾再写一次，全部为同一路径的覆盖写", async () => {
     const ctx = sessionWithSnapshot(3);
